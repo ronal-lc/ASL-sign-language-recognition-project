@@ -25,73 +25,254 @@ import cv2
 import numpy as np
 import time
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import glob
+import logging # Import logging
+from utils import setup_logging # Import the setup_logging function
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=True, min_detection_confidence=0.5)
+# Initialize MediaPipe Hands solution globally for potential re-use if safe,
+# otherwise, it might need to be initialized per process if it's not picklable
+# or has issues with multiprocessing. For this refactoring, we assume it can be
+# initialized globally or passed/re-initialized in the worker function.
+# For ProcessPoolExecutor, it's generally safer to initialize such objects
+# within the worker function if they maintain internal state or are not picklable.
+# mp_hands_solution = mp.solutions.hands
 
 DATA_DIR = './data'
-data = []
-labels = []
-
 EXPECTED_LANDMARK_LENGTH = 42  # 21 hand landmarks, each with (x, y)
+CHECKPOINT_FILE = 'dataset_checkpoint.pkl'
+CHECKPOINT_INTERVAL = 100 # Save checkpoint after every N original images processed
 
-def process_image(img):
-    """Extract normalized hand landmarks from an image using MediaPipe."""
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = hands.process(img_rgb)
+# Global hands object for the main process (e.g. for single-threaded fallback or utilities)
+# This might not be used by worker processes if they initialize their own.
+# hands_main_process = mp_hands_solution.Hands(static_image_mode=True, min_detection_confidence=0.5)
 
-    if results.multi_hand_landmarks:
-        landmarks = []
-        for hand_landmarks in results.multi_hand_landmarks:
-            coords = np.array([(lm.x, lm.y) for lm in hand_landmarks.landmark])
-            x_min, y_min = coords.min(axis=0)
-            coords[:, 0] -= x_min
-            coords[:, 1] -= y_min
-            landmarks.extend(coords.flatten())
-        if len(landmarks) == EXPECTED_LANDMARK_LENGTH:
-            return landmarks
-    return None
 
-start_time = time.time()
-total_images = sum(
-    len([file for file in files if file.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    for r, d, files in os.walk(DATA_DIR)
-)
+def initialize_worker():
+    """Initializer for each worker process. Sets up MediaPipe Hands."""
+    global hands_worker
+    try:
+        hands_worker = mp.solutions.hands.Hands(static_image_mode=True, min_detection_confidence=0.5)
+        logging.debug(f"Worker process {os.getpid()} initialized MediaPipe Hands successfully.")
+    except Exception as e:
+        logging.error(f"Worker process {os.getpid()} failed to initialize MediaPipe Hands: {e}", exc_info=True)
+        hands_worker = None # Ensure it's None if initialization fails
 
-with tqdm(total=total_images, desc="Processing images", dynamic_ncols=True) as pbar:
-    for label in os.listdir(DATA_DIR):
-        label_path = os.path.join(DATA_DIR, label)
+def process_single_image_entry(image_path_tuple):
+    """
+    Processes a single image file (original and its flip for augmentation).
+    This function is designed to be run in a worker process.
+    Initializes MediaPipe Hands within the worker if not using an initializer.
+    """
+    # If not using ProcessPoolExecutor's initializer, initialize MediaPipe Hands here:
+    # hands_local = mp.solutions.hands.Hands(static_image_mode=True, min_detection_confidence=0.5)
+
+    global hands_worker # Uses the hands object initialized by initialize_worker
+
+    if hands_worker is None: # Check if worker initialization failed
+        logging.error(f"Skipping processing for {image_path_tuple[0]} in worker {os.getpid()} due to MediaPipe initialization failure.")
+        return image_path_tuple[0], []
+
+    image_path, label_name = image_path_tuple
+    landmarks_results = [] 
+    logging.debug(f"Processing image: {image_path} for label: {label_name} in worker {os.getpid()}")
+
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            logging.warning(f"Failed to load image: {image_path}. Skipping.")
+            return image_path, [] 
+
+        # Process original image
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results_original = hands_worker.process(img_rgb) # MediaPipe process
+        if results_original.multi_hand_landmarks:
+            landmarks_list = []
+            # The rest of the landmark extraction logic seems fine.
+            # Adding detailed logging for landmark extraction can be very verbose,
+            # so we'll keep it high-level unless specific errors occur.
+            for hand_landmarks in results_original.multi_hand_landmarks:
+                coords = np.array([(lm.x, lm.y) for lm in hand_landmarks.landmark])
+                x_min, y_min = coords.min(axis=0)
+                coords[:, 0] -= x_min
+                coords[:, 1] -= y_min
+                landmarks_list.extend(coords.flatten())
+            if len(landmarks_list) == EXPECTED_LANDMARK_LENGTH:
+                landmarks_results.append({'landmarks': landmarks_list, 'label': label_name, 'source': 'original'})
+                logging.debug(f"Extracted original landmarks for {image_path}")
+            elif results_original.multi_hand_landmarks: # Log if landmarks were found but length was wrong
+                logging.warning(f"Found original hand landmarks for {image_path}, but length {len(landmarks_list)} != {EXPECTED_LANDMARK_LENGTH}.")
+
+
+        # Process horizontally flipped image (augmentation)
+        img_flipped = cv2.flip(img, 1)
+        img_flipped_rgb = cv2.cvtColor(img_flipped, cv2.COLOR_BGR2RGB)
+        results_flipped = hands_worker.process(img_flipped_rgb) # MediaPipe process
+        if results_flipped.multi_hand_landmarks:
+            landmarks_list_flipped = []
+            for hand_landmarks in results_flipped.multi_hand_landmarks:
+                coords = np.array([(lm.x, lm.y) for lm in hand_landmarks.landmark])
+                x_min, y_min = coords.min(axis=0)
+                coords[:, 0] -= x_min
+                coords[:, 1] -= y_min
+                landmarks_list_flipped.extend(coords.flatten())
+            if len(landmarks_list_flipped) == EXPECTED_LANDMARK_LENGTH:
+                 landmarks_results.append({'landmarks': landmarks_list_flipped, 'label': label_name, 'source': 'flipped'})
+                 logging.debug(f"Extracted flipped landmarks for {image_path}")
+            elif results_flipped.multi_hand_landmarks: # Log if landmarks were found but length was wrong
+                 logging.warning(f"Found flipped hand landmarks for {image_path}, but length {len(landmarks_list_flipped)} != {EXPECTED_LANDMARK_LENGTH}.")
+        
+        return image_path, landmarks_results
+    except cv2.error as e_cv2: # Specific OpenCV errors
+        logging.error(f"OpenCV error processing {image_path}: {e_cv2}", exc_info=True)
+        return image_path, [] 
+    except Exception as e_generic: # Other errors (e.g., MediaPipe, NumPy)
+        logging.error(f"Generic error processing {image_path} in worker {os.getpid()}: {e_generic}", exc_info=True)
+        return image_path, [] 
+
+def load_checkpoint():
+    """Loads data from the checkpoint file if it exists."""
+    if os.path.exists(CHECKPOINT_FILE):
+        logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' found. Attempting to load.")
+        try:
+            with open(CHECKPOINT_FILE, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            logging.info("Checkpoint loaded successfully.")
+            return checkpoint_data.get('data', []), checkpoint_data.get('labels', []), checkpoint_data.get('processed_files', set())
+        except Exception as e:
+            logging.error(f"Error loading checkpoint file '{CHECKPOINT_FILE}': {e}. Starting from scratch.", exc_info=True)
+            return [], [], set()
+    else:
+        logging.info(f"No checkpoint file '{CHECKPOINT_FILE}' found. Starting from scratch.")
+        return [], [], set()
+
+def save_checkpoint(data, labels, processed_files):
+    """Saves the current state to the checkpoint file."""
+    logging.info(f"Saving checkpoint to '{CHECKPOINT_FILE}' with {len(processed_files)} processed files.")
+    checkpoint_data = {
+        'data': data, # This can be large, consider if full data save is needed every time
+        'labels': labels, # Same as above
+        'processed_files': processed_files # This is the most critical part for resuming
+    }
+    try:
+        with open(CHECKPOINT_FILE, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+        logging.info(f"Checkpoint saved successfully to '{CHECKPOINT_FILE}'.")
+    except Exception as e:
+        logging.error(f"Failed to save checkpoint to '{CHECKPOINT_FILE}': {e}", exc_info=True)
+
+
+def create_dataset_main():
+    """Main function to create the dataset using parallel processing and checkpointing."""
+    logging.info("Starting dataset creation process.")
+    data, labels, processed_files = load_checkpoint()
+    
+    initial_processed_count = len(processed_files)
+    logging.info(f"Resuming from checkpoint. Initially {initial_processed_count} files were processed.")
+    
+    start_time = time.time()
+
+    # Discover all image files
+    all_image_paths_with_labels = []
+    if not os.path.exists(DATA_DIR):
+        logging.critical(f"Data directory '{DATA_DIR}' does not exist. Cannot proceed.")
+        return
+        
+    for label_name in sorted(os.listdir(DATA_DIR)): 
+        label_path = os.path.join(DATA_DIR, label_name)
         if os.path.isdir(label_path):
-            for img_name in os.listdir(label_path):
-                img_path = os.path.join(label_path, img_name)
-                if img_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    img = cv2.imread(img_path)
-                    if img is None:
-                        print(f"Error loading image: {img_path}")
-                        continue
+            image_files = glob.glob(os.path.join(label_path, '*.jpg')) + \
+                          glob.glob(os.path.join(label_path, '*.jpeg')) + \
+                          glob.glob(os.path.join(label_path, '*.png'))
+            for img_path in sorted(image_files): 
+                 all_image_paths_with_labels.append((img_path, label_name))
+    logging.info(f"Discovered a total of {len(all_image_paths_with_labels)} images across all class directories.")
 
-                    # Process original image
-                    landmarks = process_image(img)
-                    if landmarks:
-                        data.append(landmarks)
-                        labels.append(label)
+    # Filter out already processed files
+    image_tasks_to_process = [
+        item for item in all_image_paths_with_labels if item[0] not in processed_files
+    ]
+    
+    if not image_tasks_to_process:
+        logging.info("No new images to process. Dataset is up-to-date based on checkpoint.")
+    else:
+        logging.info(f"Found {len(image_tasks_to_process)} new images to process out of {len(all_image_paths_with_labels)} total discovered images.")
 
-                    # Process horizontally flipped image (augmentation)
-                    img_flipped = cv2.flip(img, 1)
-                    landmarks_flipped = process_image(img_flipped)
-                    if landmarks_flipped:
-                        data.append(landmarks_flipped)
-                        labels.append(label)
+    num_workers = os.cpu_count() or 1 
+    logging.info(f"Using {num_workers} worker processes for image processing.")
 
+    processed_count_since_last_checkpoint = 0
+    newly_processed_files_count = 0
+
+    # Using try-except-finally to ensure resources are cleaned up if possible
+    # Note: ProcessPoolExecutor itself handles worker shutdown on exit when used as a context manager.
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers, initializer=initialize_worker) as executor:
+            futures = {executor.submit(process_single_image_entry, img_task): img_task for img_task in image_tasks_to_process}
+
+            with tqdm(total=len(image_tasks_to_process), desc="Processing images", dynamic_ncols=True) as pbar:
+                for future in as_completed(futures):
+                    original_image_path, landmarks_results_list = future.result()
+                    
+                    if landmarks_results_list: # Only add if results were actually produced
+                        for result_entry in landmarks_results_list:
+                            data.append(result_entry['landmarks'])
+                            labels.append(result_entry['label'])
+                        logging.debug(f"Successfully processed and added landmarks for {original_image_path}.")
+                    else:
+                        logging.warning(f"No landmarks extracted or error processing {original_image_path}. It will be marked as processed.")
+                    
+                    processed_files.add(original_image_path) 
+                    newly_processed_files_count += 1
                     pbar.update(1)
+                    processed_count_since_last_checkpoint +=1
 
-# Save dataset if data is available
-if data and labels:
-    with open('data_signs.pickle', 'wb') as f:
-        pickle.dump({'data': np.array(data), 'labels': np.array(labels)}, f)
-    print(f"\nProcessed {len(data)} images (including flipped).")
-else:
-    print("\nNo data processed. Please check your data directory and image files.")
+                    if processed_count_since_last_checkpoint >= CHECKPOINT_INTERVAL:
+                        save_checkpoint(data, labels, processed_files)
+                        processed_count_since_last_checkpoint = 0
+        
+        # Final save of checkpoint after loop finishes
+        if processed_count_since_last_checkpoint > 0 or newly_processed_files_count > 0 : # Save if any new work was done
+            save_checkpoint(data, labels, processed_files)
+        logging.info(f"Completed processing {newly_processed_files_count} new images.")
 
-end_time = time.time()
-print(f"Total processing time: {end_time - start_time:.2f} seconds.")
+    except Exception as e_executor:
+        logging.critical(f"An error occurred during parallel processing: {e_executor}", exc_info=True)
+        # Data up to the last successful checkpoint is preserved.
+        # Consider if a final checkpoint save attempt is useful here, though data might be inconsistent.
+
+    # Save the final complete dataset
+    if data and labels:
+        logging.info(f"Saving final dataset to 'data_signs.pickle'. Total landmark entries: {len(data)}.")
+        try:
+            with open('data_signs.pickle', 'wb') as f:
+                pickle.dump({'data': np.array(data), 'labels': np.array(labels)}, f)
+            logging.info(f"Final dataset 'data_signs.pickle' saved successfully.")
+            
+            # Optional: remove checkpoint file after successful completion
+            if os.path.exists(CHECKPOINT_FILE) and newly_processed_files_count == len(image_tasks_to_process) and len(image_tasks_to_process) > 0:
+                 # Only remove if all tasks were processed successfully in this run
+                 # os.remove(CHECKPOINT_FILE) 
+                 # logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' removed after successful completion.")
+                 logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' retained. Remove manually if not needed for future resumption.")
+            elif os.path.exists(CHECKPOINT_FILE):
+                 logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' retained as not all tasks may have been processed in this run or it was already up-to-date.")
+
+        except Exception as e_pickle_save:
+            logging.critical(f"Failed to save the final dataset to 'data_signs.pickle': {e_pickle_save}", exc_info=True)
+    else:
+        logging.warning("No data was processed or loaded. Final dataset 'data_signs.pickle' was not created.")
+
+    end_time = time.time()
+    logging.info(f"Total processing time for this run: {end_time - start_time:.2f} seconds.")
+    logging.info("Dataset creation process finished.")
+
+
+if __name__ == "__main__":
+    setup_logging(log_level=logging.INFO, log_file="create_dataset.log")
+    
+    if not os.path.exists(DATA_DIR) or not os.listdir(DATA_DIR):
+        logging.error(f"Data directory '{DATA_DIR}' is missing or empty.")
+        logging.error("Please populate it with image subfolders (A, B, C, etc.) before running.")
+    else:
+        create_dataset_main()
