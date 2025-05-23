@@ -112,4 +112,4 @@ Please ensure your code follows the existing style and includes relevant documen
 
 ## License
 
-This project is currently unlicensed. (Or specify a license, e.g., "This project is licensed under the MIT License.")
+This project is currently unlicensed.
