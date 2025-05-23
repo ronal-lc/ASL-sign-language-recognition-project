@@ -38,7 +38,7 @@ The project is organized into several Python scripts and data files:
 
 1.  **Clone the Repository:**
     ```bash
-    git clone <repository_url>
+    git clone https://github.com/ronal-lc/ASL-sign-language-recognition-project.git
     cd asl-alphabet-recognizer 
     ```
     (Replace `<repository_url>` with the actual URL of the repository.)
