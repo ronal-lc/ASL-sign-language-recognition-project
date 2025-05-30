@@ -24,30 +24,28 @@ from tensorflow.keras.layers import Dense, Dropout, Input # Dropout is imported 
 from tensorflow.keras.optimizers import Adam
 import os 
 import numpy as np
-import logging 
-from utils import setup_logging 
 import json # Import json for saving metrics
 
 
 def train_model_main():
     """Main function to train the model."""
-    logging.info("Starting model training process.")
+    print("INFO: Starting model training process.")
     
     # Check if data_signs.pickle exists
     pickle_file_path = 'data_signs.pickle'
     if not os.path.exists(pickle_file_path):
-        logging.critical(f"Error: Dataset file '{pickle_file_path}' not found.")
-        logging.critical("Please generate the dataset by running 'create_dataset.py' first.")
+        print(f"CRITICAL: Error: Dataset file '{pickle_file_path}' not found.")
+        print("CRITICAL: Please generate the dataset by running 'create_dataset.py' first.")
         return
 
     # Load dataset
-    logging.info(f"Loading dataset from '{pickle_file_path}'.")
+    print(f"INFO: Loading dataset from '{pickle_file_path}'.")
     try:
         with open(pickle_file_path, 'rb') as f:
             dataset = pickle.load(f)
-        logging.info("Dataset loaded successfully.")
+        print("INFO: Dataset loaded successfully.")
     except Exception as e:
-        logging.error(f"Error loading '{pickle_file_path}': {e}", exc_info=True)
+        print(f"ERROR: Error loading '{pickle_file_path}': {e}")
         return
     # This line was duplicated in the original provided code, removing one.
     # dataset = pickle.load(f) 
@@ -57,68 +55,68 @@ def train_model_main():
     y = dataset.get('labels')
 
     if X is None or y is None:
-        logging.error("Error: 'data' or 'labels' key not found in dataset file.")
+        print("ERROR: 'data' or 'labels' key not found in dataset file.")
         return
     
     if not isinstance(X, np.ndarray) or not isinstance(y, np.ndarray):
-        logging.error("Error: Data or labels in dataset file are not numpy arrays.")
+        print("ERROR: Data or labels in dataset file are not numpy arrays.")
         return
 
     if len(X) == 0: # len(y) would also be 0 if X is 0, given the check below
-        logging.error("Error: Data or labels are empty in dataset file.")
+        print("ERROR: Data or labels are empty in dataset file.")
         return
         
     if len(X) != len(y):
-        logging.error(f"Error: Mismatch in number of samples between data ({len(X)}) and labels ({len(y)}).")
+        print(f"ERROR: Mismatch in number of samples between data ({len(X)}) and labels ({len(y)}).")
         return
-    logging.info(f"Dataset contains {len(X)} samples.")
+    print(f"INFO: Dataset contains {len(X)} samples.")
 
     # Encode labels as integers
     if y.dtype == 'object' or isinstance(y[0], str): # Check if labels are strings that need encoding
-        logging.info("Attempting to encode string labels to integers.")
+        print("INFO: Attempting to encode string labels to integers.")
         label_encoder = LabelEncoder()
         try:
             y_encoded = label_encoder.fit_transform(y)
-            logging.info(f"Labels encoded successfully. Example - Original: {y[:3]}, Encoded: {y_encoded[:3]}")
+            print(f"INFO: Labels encoded successfully. Example - Original: {y[:3]}, Encoded: {y_encoded[:3]}")
         except Exception as e:
-            logging.error(f"Error during label encoding: {e}", exc_info=True)
+            print(f"ERROR: Error during label encoding: {e}")
             return
     else: # Labels are already encoded (assumed numeric)
         y_encoded = y 
-        logging.info(f"Labels appear to be already numerically encoded. Example: {y_encoded[:3]}")
+        print(f"INFO: Labels appear to be already numerically encoded. Example: {y_encoded[:3]}")
 
     # Stratified train-test split
-    logging.info("Splitting data into training and testing sets.")
+    print("INFO: Splitting data into training and testing sets.")
     try:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
         )
-        logging.info(f"Data split successfully. Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+        print(f"INFO: Data split successfully. Training samples: {len(X_train)}, Test samples: {len(X_test)}")
     except ValueError as e:
-        logging.warning(f"Error during stratified train_test_split: {e}. This might be due to insufficient samples for some classes for stratification.")
-        logging.info("Attempting train_test_split without stratification as a fallback.")
+        print(f"WARNING: Error during stratified train_test_split: {e}. This might be due to insufficient samples for some classes for stratification.")
+        print("INFO: Attempting train_test_split without stratification as a fallback.")
         try:
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y_encoded, test_size=0.2, random_state=42 # No stratify
             )
-            logging.info(f"Fallback data split successful. Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+            print(f"INFO: Fallback data split successful. Training samples: {len(X_train)}, Test samples: {len(X_test)}")
         except Exception as e_fallback:
-            logging.error(f"Fallback train_test_split also failed: {e_fallback}", exc_info=True)
+            print(f"ERROR: Fallback train_test_split also failed: {e_fallback}")
             return
     except Exception as e_split_other:
-         logging.error(f"An unexpected error occurred during data splitting: {e_split_other}", exc_info=True)
+         print(f"ERROR: An unexpected error occurred during data splitting: {e_split_other}")
          return
 
 
     # Neural network model definition
     num_classes = len(np.unique(y_encoded))
     if num_classes <= 1:
-        logging.error(f"Error: The dataset must contain at least 2 unique classes for classification. Found: {num_classes}")
+        print(f"ERROR: The dataset must contain at least 2 unique classes for classification. Found: {num_classes}")
         return
-    logging.info(f"Defining neural network model for {num_classes} classes.")
+    print(f"INFO: Defining neural network model for {num_classes} classes.")
     
     if X_train.shape[1] == 0: # Should not happen if data loading was successful
-        logging.error("Error: Training data has no features (X_train.shape[1] is 0).")
+        print("ERROR: Training data has no features (X_train.shape[1] is 0).")
         return
 
     model = Sequential([
@@ -127,24 +125,24 @@ def train_model_main():
         Dense(64, activation='relu'),
         Dense(num_classes, activation='softmax')
     ])
-    logging.info("Model defined successfully.")
+    print("INFO: Model defined successfully.")
 
     # Compile the model
-    logging.info("Compiling the model with Adam optimizer and sparse_categorical_crossentropy loss.")
+    print("INFO: Compiling the model with Adam optimizer and sparse_categorical_crossentropy loss.")
     try:
         model.compile(
             optimizer=Adam(learning_rate=0.0005), 
             loss='sparse_categorical_crossentropy', 
             metrics=['accuracy'] 
         )
-        logging.info("Model compiled successfully.")
-        model.summary(print_fn=logging.info) # Log model summary
+        print("INFO: Model compiled successfully.")
+        model.summary() # Log model summary
     except Exception as e:
-        logging.error(f"Error compiling the Keras model: {e}", exc_info=True)
+        print(f"ERROR: Error compiling the Keras model: {e}")
         return
 
 
-    logging.info("Starting model training...")
+    print("INFO: Starting model training...")
     try:
         history = model.fit(
             X_train, y_train,
@@ -153,55 +151,55 @@ def train_model_main():
             validation_data=(X_test, y_test),
             verbose=1 # 0=silent, 1=progress bar, 2=one line per epoch. Keep 1 for user feedback.
         )
-        logging.info("Model training completed.")
+        print("INFO: Model training completed.")
         # Log some training history highlights
         if history and history.history:
             final_train_acc = history.history['accuracy'][-1]
             final_val_acc = history.history['val_accuracy'][-1]
-            logging.info(f"Final training accuracy: {final_train_acc:.4f}, Final validation accuracy: {final_val_acc:.4f}")
+            print(f"INFO: Final training accuracy: {final_train_acc:.4f}, Final validation accuracy: {final_val_acc:.4f}")
     except Exception as e: # Catch specific TF/Keras errors if possible, or general Exception
-        logging.error(f"An error occurred during model training: {e}", exc_info=True)
+        print(f"ERROR: An error occurred during model training: {e}")
         # Potentially log more details from TF if available, e.g. tf.get_logger()
         return
 
 
-    logging.info("Evaluating model on the test set...")
+    print("INFO: Evaluating model on the test set...")
     try:
         loss, accuracy = model.evaluate(X_test, y_test, verbose=1) 
-        logging.info(f"Model Test Accuracy: {accuracy * 100:.2f}%")
-        logging.info(f"Model Test Loss: {loss:.4f}")
+        print(f"INFO: Model Test Accuracy: {accuracy * 100:.2f}%")
+        print(f"INFO: Model Test Loss: {loss:.4f}")
 
         # Save metrics to a JSON file
         metrics_data = {"accuracy": accuracy, "loss": loss}
         metrics_file_path = 'training_metrics.json'
-        logging.info(f"Saving training metrics to '{metrics_file_path}'.")
+        print(f"INFO: Saving training metrics to '{metrics_file_path}'.")
         try:
             with open(metrics_file_path, 'w') as f_metrics:
                 json.dump(metrics_data, f_metrics, indent=4)
-            logging.info(f"Metrics saved successfully to '{metrics_file_path}'.")
+            print(f"INFO: Metrics saved successfully to '{metrics_file_path}'.")
         except Exception as e_metrics:
-            logging.error(f"Error saving metrics to '{metrics_file_path}': {e_metrics}", exc_info=True)
+            print(f"ERROR: Error saving metrics to '{metrics_file_path}': {e_metrics}")
             # Do not return here, as model saving might still be important
 
     except Exception as e:
-        logging.error(f"An error occurred during model evaluation: {e}", exc_info=True)
+        print(f"ERROR: An error occurred during model evaluation: {e}")
         # Consider if we should still attempt to save the model if evaluation fails
         # For now, we will return as the metrics won't be available.
         return
 
     # Save the trained model
     model_save_path = 'model.keras'
-    logging.info(f"Saving the trained model to '{model_save_path}'.")
+    print(f"INFO: Saving the trained model to '{model_save_path}'.")
     try:
         model.save(model_save_path)
-        logging.info(f"Model saved successfully as '{model_save_path}'")
+        print(f"INFO: Model saved successfully as '{model_save_path}'")
     except Exception as e:
-        logging.error(f"Error saving model to '{model_save_path}': {e}", exc_info=True)
+        print(f"ERROR: Error saving model to '{model_save_path}': {e}")
         # If model saving fails, this is a significant issue for the pipeline.
         # Depending on requirements, might want to indicate failure more strongly.
 
-    logging.info("Model training process finished.")
+    print("INFO: Model training process finished.")
 
 if __name__ == "__main__":
-    setup_logging(log_level=logging.INFO, log_file="data_classify.log")
+    # setup_logging(log_level=logging.INFO, log_file="data_classify.log") # Removed
     train_model_main()

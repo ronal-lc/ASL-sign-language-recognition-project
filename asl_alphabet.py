@@ -29,8 +29,6 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from tensorflow.keras.models import load_model
-import logging
-from utils import setup_logging
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
                                QVBoxLayout, QHBoxLayout, QWidget, QTabWidget,
@@ -41,10 +39,12 @@ from PySide6.QtCore import QTimer, Qt, QSize, Slot, QSettings
 # Import PIL.Image explicitly for image loading in learning mode
 from PIL import Image
 
+from PySide6.QtCore import QThread, Signal # Added for QThread
 
 WINDOW_NAME = 'ASL Alphabet Recognition'
 ICON_PATH = 'icono.ico'
 ALPHABET_PATH = "alphabet_examples"
+MODEL_PATH = './model.keras' # Added for model path
 
 # --- Theme Stylesheets --- (Can be moved to separate files if they grow large)
 LIGHT_THEME_STYLESHEET = """
@@ -273,6 +273,143 @@ DARK_THEME_STYLESHEET = """
     }
 """
 
+class CameraProcessingThread(QThread):
+    frame_ready = Signal(QImage)
+    prediction_ready = Signal(str)
+    status_update = Signal(str)
+    model_loaded = Signal(bool)
+    mediapipe_loaded = Signal(bool)
+
+    def __init__(self, model_path, alphabet_path, labels_dict):
+        super().__init__()
+        self.model_path = model_path
+        self.alphabet_path = alphabet_path # Though not used in run() as per current logic
+        self.labels_dict = labels_dict
+        self.cap = None
+        self.hands_instance = None
+        self.model = None
+        self.drawing_utils = mp.solutions.drawing_utils
+        self.drawing_styles = mp.solutions.drawing_styles
+        self.hands_solution = mp.solutions.hands
+        self.running = True
+
+    def run(self):
+        # Initialization Phase
+        try:
+            self.model = load_model(self.model_path)
+            self.model_loaded.emit(True)
+            self.status_update.emit("Keras model loaded successfully.")
+        except Exception as e:
+            self.model_loaded.emit(False)
+            self.status_update.emit(f"Error loading Keras model: {e}")
+            return
+
+        try:
+            self.hands_instance = self.hands_solution.Hands(
+                static_image_mode=False, max_num_hands=1,
+                min_detection_confidence=0.8, min_tracking_confidence=0.5)
+            self.mediapipe_loaded.emit(True)
+            self.status_update.emit("MediaPipe Hands initialized successfully.")
+        except Exception as e:
+            self.mediapipe_loaded.emit(False)
+            self.status_update.emit(f"Failed to initialize MediaPipe Hands: {e}")
+            return
+
+        camera_indices_to_try = [0, 1, 2]
+        for camera_index in camera_indices_to_try:
+            cap_test = cv2.VideoCapture(camera_index)
+            if cap_test.isOpened():
+                self.cap = cap_test
+                self.status_update.emit(f"Successfully opened camera with index: {camera_index}")
+                break
+            cap_test.release()
+        
+        if self.cap is None:
+            self.status_update.emit("Error: Camera not found")
+            return
+
+        # Processing Loop
+        while self.running:
+            if not self.cap or not self.cap.isOpened():
+                self.status_update.emit("Error: Camera disconnected or failed.")
+                self.running = False # Stop the loop if camera fails
+                break
+
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                self.status_update.emit("Error capturing frame.")
+                time.sleep(0.05) # Wait a bit before retrying
+                continue
+
+            H, W, _ = frame.shape
+            
+            # Emit raw camera frame for display
+            frame_rgb_for_qimage = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            q_image = QImage(frame_rgb_for_qimage.data, W, H, frame_rgb_for_qimage.strides[0], QImage.Format_RGB888)
+            self.frame_ready.emit(q_image.copy()) # Emit a copy
+
+            # Hand landmark detection
+            frame_rgb_for_mediapipe = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Separate conversion for mediapipe
+            frame_rgb_for_mediapipe.flags.writeable = False
+            results = self.hands_instance.process(frame_rgb_for_mediapipe)
+            # frame_rgb_for_mediapipe.flags.writeable = True # Not strictly needed as we draw on a copy or not at all here
+
+            predicted_character_for_signal = "" # Default to empty string
+
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # Optionally, one could draw landmarks here on a copy of the frame
+                    # and emit that as a separate signal if needed, or let main thread draw.
+                    # For simplicity, this example focuses on prediction.
+
+                    data_aux = []
+                    x_coords = [lm.x for lm in hand_landmarks.landmark]
+                    y_coords = [lm.y for lm in hand_landmarks.landmark]
+                    if not x_coords or not y_coords: continue
+
+                    min_x, min_y = min(x_coords), min(y_coords)
+                    for i in range(len(x_coords)):
+                        data_aux.append(x_coords[i] - min_x)
+                        data_aux.append(y_coords[i] - min_y)
+                    
+                    if self.model and len(data_aux) == self.model.input_shape[1]:
+                        prediction_array = np.array([data_aux])
+                        try:
+                            prediction_result = self.model.predict(prediction_array, verbose=0)
+                            max_prob = np.max(prediction_result[0])
+                            predicted_index = np.argmax(prediction_result[0])
+                            predicted_character = self.labels_dict.get(predicted_index, '?')
+                            
+                            # For now, only emit if confidence is high for non-STOP, or very high for STOP
+                            # This logic can be adjusted or moved to main thread based on `prediction_ready`
+                            if (predicted_character == "STOP" and max_prob >= 0.99) or \
+                               (predicted_character != "STOP" and 'A' <= predicted_character <= 'Z' and max_prob >= 0.95):
+                                predicted_character_for_signal = predicted_character # Store it to emit after loop
+
+                        except Exception as e_predict:
+                            self.status_update.emit(f"Model prediction error: {e_predict}")
+                            # Continue, don't break loop for one prediction error
+                
+                if predicted_character_for_signal: # Emit if a valid prediction was made
+                    self.prediction_ready.emit(predicted_character_for_signal)
+
+            # Small delay to control processing speed and allow GUI events
+            time.sleep(0.01) 
+
+        # Cleanup Phase
+        if self.cap:
+            self.cap.release()
+            self.status_update.emit("Camera released.")
+        if self.hands_instance:
+            self.hands_instance.close() # Assuming MediaPipe Hands has a close method or similar cleanup
+            self.status_update.emit("MediaPipe Hands closed.")
+        self.status_update.emit("CameraProcessingThread finished.")
+
+    def stop(self):
+        self.running = False
+        self.status_update.emit("Stopping CameraProcessingThread...")
+        # self.wait() # Wait for the run() method to complete. Consider timeout.
+
 
 class ASLRecognitionApp(QMainWindow):
     # Define base font size and scaling limits
@@ -286,10 +423,9 @@ class ASLRecognitionApp(QMainWindow):
         self.setWindowTitle(WINDOW_NAME)
         if os.path.exists(ICON_PATH):
             try: self.setWindowIcon(QIcon(ICON_PATH))
-            except Exception as e: logging.warning(f"Could not load main window icon '{ICON_PATH}': {e}")
+            except Exception as e: print(f"Could not load main window icon '{ICON_PATH}': {e}")
         
-        self.setGeometry(100, 100, 900, 800) # Increased height for theme/font controls
-        # self.setFixedSize(900, 730) # Comment out or adjust if making resizable
+        self.setGeometry(100, 100, 900, 800)
 
         self.detected_phrase = ""
         self.last_detected_letter = ""
@@ -300,34 +436,107 @@ class ASLRecognitionApp(QMainWindow):
         self.current_learning_letter = ""
         self.learning_mode_active = False
         
-        self.cap = None
-        self.hands_solution = None
-        self.hands_instance = None
-        self.drawing_utils = None
-        self.drawing_styles = None
-        self.model = None
         self.labels_dict = {i: chr(65 + i) for i in range(26)}
         self.labels_dict[26] = "STOP"
 
         self.settings = QSettings("ASLApp", "Preferences")
-        self._load_settings() # Load theme and font scale
+        self._load_settings()
 
-        self._setup_resources()
-        self._setup_ui()
-        self.apply_theme(self.current_theme_name) # Apply loaded theme
-        self.apply_font_scale(self.CURRENT_FONT_SCALE_FACTOR, initial_setup=True) # Apply loaded font scale
+        # self._setup_resources() # Delegated to thread
+        self._setup_ui() # Setup UI first
+        
+        self.apply_theme(self.current_theme_name)
+        self.apply_font_scale(self.CURRENT_FONT_SCALE_FACTOR, initial_setup=True)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_gui_frame)
-        if self.cap and self.cap.isOpened() and self.hands_instance and self.model:
-            self.timer.start(30)
+        # Camera and Processing Thread Setup
+        self.camera_thread = CameraProcessingThread(MODEL_PATH, ALPHABET_PATH, self.labels_dict)
+        self.camera_thread.frame_ready.connect(self.display_video_frame)
+        self.camera_thread.prediction_ready.connect(self.update_prediction)
+        self.camera_thread.status_update.connect(self.handle_status_update)
+        self.camera_thread.model_loaded.connect(self.on_model_loaded)
+        self.camera_thread.mediapipe_loaded.connect(self.on_mediapipe_loaded)
+        
+        self.camera_thread.start()
+        print("ASLRecognitionApp initialized and camera thread started.")
+
+    @Slot(QImage)
+    def display_video_frame(self, q_image):
+        pixmap = QPixmap.fromImage(q_image)
+        self.video_label.setPixmap(pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    @Slot(str)
+    def update_prediction(self, predicted_character):
+        current_time = time.time()
+        # Logic adapted from old update_gui_frame
+        if predicted_character == "STOP": # Assuming high confidence check is done in thread for STOP
+            if self.stop_detection_time == 0: self.stop_detection_time = current_time
+            elif current_time - self.stop_detection_time >= 2.0:
+                if not self.stop_detected:
+                    self.stop_detected = True
+                    print("INFO: STOP detected and held.")
+                    self.phrase_label.setStyleSheet(f"font-size: 16px; background-color: darkblue; color: white; padding: 5px; border-radius: 5px;")
+        else: # Reset stop detection if other char or no char
+            self.stop_detection_time = 0
+            # If stop was previously detected and now it's not, reset style
+            if self.stop_detected and predicted_character != "STOP": # Check if it was a real character
+                 self.stop_detected = False # Reset if a valid non-STOP character is detected
+                 self.phrase_label.setStyleSheet(f"font-size: 16px; background-color: {'#383838' if self.current_theme_name == 'Dark' else '#e0e0e0'}; color: {'#cfcfcf' if self.current_theme_name == 'Dark' else 'black'}; padding: 5px; border-radius: 5px;")
+
+
+        if not self.stop_detected and predicted_character and predicted_character != "STOP":
+            # Confidence for A-Z check is assumed to be handled in thread before emitting signal
+            if self.learning_mode_active:
+                if self.current_learning_letter == "DONE": pass
+                elif not self.current_learning_letter: self.load_learning_image_pyside()
+
+                if predicted_character == self.current_learning_letter:
+                    if self.continuous_detection_start == 0: self.continuous_detection_start = current_time
+                    if current_time - self.continuous_detection_start >= 2.0:
+                        print(f"INFO: Correctly practiced letter: {predicted_character}.")
+                        self.load_learning_image_pyside(exclude_letter=self.current_learning_letter)
+                        self.continuous_detection_start = 0
+                else:
+                    self.continuous_detection_start = 0
+            else: # Normal recognition mode
+                if predicted_character != self.last_detected_letter or (current_time - self.last_detection_time >= 1.5):
+                    self.detected_phrase += predicted_character
+                    self.last_detected_letter = predicted_character
+                    self.last_detection_time = current_time
+                    self.phrase_label.setText(f"Detected: {self.detected_phrase}")
+                    print(f"INFO: Stored: {predicted_character}. Phrase: '{self.detected_phrase}'")
+        
+        # Update phrase label if not in learning mode or if phrase needs to be cleared
+        if not self.learning_mode_active :
+            self.phrase_label.setText(f"Detected: {self.detected_phrase}")
+
+
+    @Slot(str)
+    def handle_status_update(self, message):
+        print(f"THREAD_STATUS: {message}")
+        # Optionally, display important status messages in the UI, e.g., self.phrase_label or a status bar
+        if "Error" in message or "Failed" in message :
+             self.phrase_label.setText(message) # Show critical errors on phrase_label
+
+    @Slot(bool)
+    def on_model_loaded(self, loaded):
+        if loaded:
+            print("Model successfully loaded by thread.")
+            # Enable UI elements that depend on the model
         else:
-            logging.critical("Failed to initialize critical components. Video feed will not start.")
-            if hasattr(self, 'video_label'):
-                 self.video_label.setText("Error: Camera or necessary models failed to load. Check logs.")
-            else:
-                 print("CRITICAL: Camera or necessary models failed to load. Check logs.")
-        logging.info("ASLRecognitionApp initialized.")
+            print("Model loading failed in thread.")
+            self.video_label.setText("Error: Keras model failed to load. Check logs.")
+            # Disable UI elements
+
+    @Slot(bool)
+    def on_mediapipe_loaded(self, loaded):
+        if loaded:
+            print("MediaPipe successfully loaded by thread.")
+            # Enable UI elements that depend on MediaPipe
+        else:
+            print("MediaPipe loading failed in thread.")
+            self.video_label.setText("Error: MediaPipe failed to load. Check logs.")
+            # Disable UI elements
+
 
     def _load_settings(self):
         self.current_theme_name = self.settings.value("theme", "Light") # Default to Light
@@ -335,16 +544,17 @@ class ASLRecognitionApp(QMainWindow):
             self.CURRENT_FONT_SCALE_FACTOR = float(self.settings.value("font_scale", 1.0))
         except ValueError:
             self.CURRENT_FONT_SCALE_FACTOR = 1.0
-        logging.info(f"Loaded settings: Theme='{self.current_theme_name}', FontScale={self.CURRENT_FONT_SCALE_FACTOR}")
+        print(f"Loaded settings: Theme='{self.current_theme_name}', FontScale={self.CURRENT_FONT_SCALE_FACTOR}")
 
 
     def _save_settings(self):
         self.settings.setValue("theme", self.current_theme_name)
         self.settings.setValue("font_scale", self.CURRENT_FONT_SCALE_FACTOR)
-        logging.info(f"Saved settings: Theme='{self.current_theme_name}', FontScale={self.CURRENT_FONT_SCALE_FACTOR}")
+        print(f"Saved settings: Theme='{self.current_theme_name}', FontScale={self.CURRENT_FONT_SCALE_FACTOR}")
 
     def _setup_ui(self):
-        logging.debug("Setting up UI with tabs and theme/font controls.")
+        # This method remains largely the same, but video_label initial text might change.
+        print("Setting up UI with tabs and theme/font controls.")
         
         # Create a main vertical layout for the central widget
         central_widget = QWidget()
@@ -363,12 +573,12 @@ class ASLRecognitionApp(QMainWindow):
         self.video_label = QLabel("Initializing Camera...")
         self.video_label.setObjectName("VideoLabel") # For specific styling
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(800, 520) # Adjusted size for controls below
+        self.video_label.setMinimumSize(800, 520) 
         recognition_layout.addWidget(self.video_label)
 
-        self.phrase_label = QLabel("Detected: ")
+        self.phrase_label = QLabel("Initializing components...") # Updated initial text
         self.phrase_label.setObjectName("PhraseLabel")
-        self.phrase_label.setFixedHeight(30)
+        self.phrase_label.setFixedHeight(30) # Keep fixed height
         recognition_layout.addWidget(self.phrase_label)
         
         recognition_controls_layout = QHBoxLayout()
@@ -380,9 +590,9 @@ class ASLRecognitionApp(QMainWindow):
                 self.reset_button.setIcon(QIcon("reset.png"))
                 self.reset_button.setIconSize(QSize(32, 32)); self.reset_button.setFixedSize(QSize(48,48))
             except Exception as e_icon:
-                 logging.warning(f"Failed to load reset.png as icon: {e_icon}."); self.reset_button.setText("Reset")
+                 print(f"Failed to load reset.png as icon: {e_icon}."); self.reset_button.setText("Reset")
         else:
-            self.reset_button.setText("Reset"); logging.warning("reset.png not found.")
+            self.reset_button.setText("Reset"); print("reset.png not found.")
         self.reset_button.clicked.connect(self.reset_detected_text_action)
         recognition_controls_layout.addWidget(self.reset_button)
         recognition_layout.addLayout(recognition_controls_layout)
@@ -434,56 +644,22 @@ class ASLRecognitionApp(QMainWindow):
         # Add settings groupbox to the main layout, below the tabs
         main_layout.addWidget(settings_groupbox)
         
-        logging.debug("UI setup with tabs and theme/font controls complete.")
+        print("UI setup with tabs and theme/font controls complete.")
 
-
+    # _setup_resources is now largely handled by CameraProcessingThread
     def _setup_resources(self):
-        logging.info("Setting up camera, MediaPipe, and TensorFlow model.")
-        model_path = './model.keras'
-        if not os.path.exists(model_path):
-            logging.critical(f"Model file '{model_path}' not found.")
-            return
-        try:
-            self.model = load_model(model_path)
-            logging.info("Keras model loaded successfully.")
-        except Exception as e:
-            logging.critical(f"Critical error loading Keras model '{model_path}': {e}", exc_info=True)
-            return
+        # This method can be removed or repurposed if there are other non-thread resources.
+        # For now, we'll leave it commented out or minimal.
+        print("Resource setup delegated to CameraProcessingThread.")
+        pass
 
-        camera_indices_to_try = [0, 1, 2]
-        for camera_index in camera_indices_to_try:
-            cap_test = cv2.VideoCapture(camera_index)
-            if cap_test.isOpened():
-                self.cap = cap_test
-                logging.info(f"Successfully opened camera with index: {camera_index}")
-                break
-            cap_test.release()
-        
-        if self.cap is None:
-            logging.critical("Could not open webcam.")
-            return
-
-        try:
-            self.hands_solution = mp.solutions.hands
-            self.drawing_utils = mp.solutions.drawing_utils
-            self.drawing_styles = mp.solutions.drawing_styles
-            self.hands_instance = self.hands_solution.Hands(
-                static_image_mode=False, max_num_hands=1,
-                min_detection_confidence=0.8, min_tracking_confidence=0.5)
-            logging.info("MediaPipe Hands initialized successfully.")
-        except Exception as e:
-            logging.critical(f"Failed to initialize MediaPipe Hands: {e}", exc_info=True)
-            if self.cap: self.cap.release()
-            self.cap = None 
-            return
-        logging.info("Resources setup complete.")
 
     @Slot(str)
     def apply_theme_from_combo(self, theme_name):
         self.apply_theme(theme_name)
 
     def apply_theme(self, theme_name):
-        logging.info(f"Applying theme: {theme_name}")
+        print(f"Applying theme: {theme_name}")
         self.current_theme_name = theme_name # Store current theme name
         if theme_name == "Dark":
             QApplication.instance().setStyleSheet(DARK_THEME_STYLESHEET)
@@ -538,13 +714,13 @@ class ASLRecognitionApp(QMainWindow):
         if not initial_setup: # Avoid re-applying during initial setup if already handled
              self.apply_theme(self.current_theme_name) 
         
-        logging.info(f"Applied font scale: {self.CURRENT_FONT_SCALE_FACTOR:.1f}x, New base point size: {new_size}")
+        print(f"Applied font scale: {self.CURRENT_FONT_SCALE_FACTOR:.1f}x, New base point size: {new_size}")
 
 
     @Slot(int)
     def handle_tab_change(self, index):
         current_tab_text = self.tabs.tabText(index)
-        logging.info(f"Switched to tab: '{current_tab_text}' (Index: {index})")
+        print(f"Switched to tab: '{current_tab_text}' (Index: {index})")
         if current_tab_text == "Practice":
             self.learning_mode_active = True
             self.load_learning_image_pyside() # Load initial image for practice
@@ -552,7 +728,7 @@ class ASLRecognitionApp(QMainWindow):
             self.current_learning_letter = self.current_learning_letter # Keep or reset based on desired logic
             self.detected_phrase = "" # Clear phrase when switching to practice
             self.phrase_label.setText("Detected: ") # Update UI
-            logging.info("Learning mode activated (Practice tab).")
+            print("Learning mode activated (Practice tab).")
         else: # Recognition tab or any other tab
             self.learning_mode_active = False
             self.current_learning_letter = "" # Clear learning letter
@@ -560,29 +736,29 @@ class ASLRecognitionApp(QMainWindow):
             if hasattr(self, 'learning_image_display_label'):
                  self.learning_image_display_label.setText("Switch to 'Practice' tab to start learning.")
                  self.learning_image_display_label.setPixmap(QPixmap()) # Clear image
-            logging.info("Learning mode deactivated (Switched to Recognition or other tab).")
+            print("Learning mode deactivated (Switched to Recognition or other tab).")
 
 
     def load_learning_image_pyside(self, exclude_letter=None):
         # This method now updates self.learning_image_display_label in the "Practice" tab
         if not hasattr(self, 'learning_image_display_label'):
-            logging.error("learning_image_display_label not found. Cannot load learning image.")
+            print("ERROR: learning_image_display_label not found. Cannot load learning image.")
             return
 
         if not os.path.exists(ALPHABET_PATH) or not os.path.isdir(ALPHABET_PATH):
-            logging.error(f"Alphabet examples directory '{ALPHABET_PATH}' not found.")
+            print(f"ERROR: Alphabet examples directory '{ALPHABET_PATH}' not found.")
             self.learning_image_display_label.setText("Alphabet images not found.")
             return
         try:
             images = [f for f in os.listdir(ALPHABET_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and os.path.isfile(os.path.join(ALPHABET_PATH, f))]
             if not images:
-                logging.warning(f"No images found in '{ALPHABET_PATH}'.")
+                print(f"WARNING: No images found in '{ALPHABET_PATH}'.")
                 self.learning_image_display_label.setText("No images in alphabet folder.")
                 return
             if exclude_letter:
                 images = [img for img in images if os.path.splitext(img)[0].upper() != exclude_letter.upper()]
             if not images:
-                logging.info(f"No new images after excluding '{exclude_letter}'. All letters practiced?")
+                print(f"INFO: No new images after excluding '{exclude_letter}'. All letters practiced?")
                 self.learning_image_display_label.setText("All letters practiced! Reset or switch tabs.")
                 self.current_learning_letter = "DONE" # Special state
                 return
@@ -603,9 +779,9 @@ class ASLRecognitionApp(QMainWindow):
             scaled_pixmap = q_pixmap.scaled(self.learning_image_display_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.learning_image_display_label.setPixmap(scaled_pixmap)
             self.current_learning_letter = os.path.splitext(selected_image_name)[0].upper()
-            logging.info(f"Practice Tab: Displaying image for letter '{self.current_learning_letter}'.")
+            print(f"INFO: Practice Tab: Displaying image for letter '{self.current_learning_letter}'.")
         except Exception as e:
-            logging.error(f"Error loading learning image for Practice tab: {e}", exc_info=True)
+            print(f"ERROR: Error loading learning image for Practice tab: {e}")
             self.learning_image_display_label.setText("Error loading image.")
 
     @Slot()
@@ -614,158 +790,60 @@ class ASLRecognitionApp(QMainWindow):
         self.stop_detected = False
         self.phrase_label.setText("Detected: ") 
         self.phrase_label.setStyleSheet("font-size: 16px; background-color: #e0e0e0; color: black; padding: 5px; border-radius: 5px;")
-        logging.info("Detected text and STOP state reset.")
+        print("INFO: Detected text and STOP state reset.")
 
-    @Slot()
-    def update_gui_frame(self):
-        if not self.cap or not self.cap.isOpened(): return
-
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            logging.warning("Error capturing frame for GUI update.")
-            return
-        
-        H, W, _ = frame.shape
-        frame_rgb_for_mediapipe = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_rgb_for_mediapipe.flags.writeable = False
-        results = self.hands_instance.process(frame_rgb_for_mediapipe)
-        # frame_rgb_for_mediapipe.flags.writeable = True # Not strictly needed as we draw on 'frame'
-
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                self.drawing_utils.draw_landmarks(
-                    frame, hand_landmarks, self.hands_solution.HAND_CONNECTIONS,
-                    self.drawing_styles.get_default_hand_landmarks_style(),
-                    self.drawing_styles.get_default_hand_connections_style())
-
-                data_aux = []
-                x_coords = [lm.x for lm in hand_landmarks.landmark]
-                y_coords = [lm.y for lm in hand_landmarks.landmark]
-                if not x_coords or not y_coords: continue
-
-                min_x, min_y = min(x_coords), min(y_coords)
-                for i in range(len(x_coords)):
-                    data_aux.append(x_coords[i] - min_x)
-                    data_aux.append(y_coords[i] - min_y)
-                
-                if self.model and len(data_aux) == self.model.input_shape[1]:
-                    prediction_array = np.array([data_aux])
-                    try:
-                        prediction_result = self.model.predict(prediction_array, verbose=0)
-                    except Exception as e_predict:
-                        logging.error(f"Model prediction error: {e_predict}", exc_info=True)
-                        continue
-
-                    max_prob = np.max(prediction_result[0])
-                    predicted_index = np.argmax(prediction_result[0])
-                    predicted_character = self.labels_dict.get(predicted_index, '?')
-                    logging.debug(f"Prediction: {predicted_character}, Confidence: {max_prob:.2f}")
-                    
-                    text_x, text_y = int(min(x_coords) * W) - 10, int(min(y_coords) * H) - 20
-                    cv2.putText(frame, f'{predicted_character} ({max_prob * 100:.1f}%)', (text_x, text_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,0), 2, cv2.LINE_AA)
-                    
-                    current_time = time.time()
-                    if predicted_character == "STOP" and max_prob >= 0.99:
-                        if self.stop_detection_time == 0: self.stop_detection_time = current_time
-                        elif current_time - self.stop_detection_time >= 2.0:
-                            if not self.stop_detected:
-                                self.stop_detected = True
-                                logging.info("STOP detected and held.")
-                    else: self.stop_detection_time = 0
-
-                    if not self.stop_detected:
-                        if predicted_character != "STOP" and 'A' <= predicted_character <= 'Z' and max_prob >= 0.95:
-                            if self.learning_mode_active: # Check if practice tab is active
-                                if self.current_learning_letter == "DONE": # All letters practiced
-                                     pass # Do nothing until tab is switched or app reset
-                                elif not self.current_learning_letter: # Load first image if none
-                                    self.load_learning_image_pyside()
-
-                                if predicted_character == self.current_learning_letter:
-                                    if self.continuous_detection_start == 0: self.continuous_detection_start = current_time
-                                    if current_time - self.continuous_detection_start >= 2.0: # Hold for 2s
-                                        # In practice mode, we don't add to detected_phrase
-                                        # We just log and load next image
-                                        logging.info(f"Correctly practiced letter: {predicted_character}.")
-                                        self.load_learning_image_pyside(exclude_letter=self.current_learning_letter)
-                                        self.continuous_detection_start = 0
-                                else: # Predicted wrong letter or not the one to practice
-                                    self.continuous_detection_start = 0
-                            else: # Normal recognition mode (Recognition Tab)
-                                if predicted_character != self.last_detected_letter or (current_time - self.last_detection_time >= 1.5):
-                                    self.detected_phrase += predicted_character
-                                    self.last_detected_letter = predicted_character
-                                    self.last_detection_time = current_time
-                                    logging.info(f"Stored: {predicted_character}. Phrase: '{self.detected_phrase}'")
-        
-        # Update UI elements that are always visible or need updating based on overall state
-        self.phrase_label.setText(f"Detected: {self.detected_phrase}")
-        self.phrase_label.setStyleSheet(f"font-size: 16px; background-color: {'darkblue' if self.stop_detected else '#e0e0e0'}; color: {'white' if self.stop_detected else 'black'}; padding: 5px; border-radius: 5px;")
-
-        # Update video feed display (always, as it's part of the core loop)
-        frame_display_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_display_rgb.shape
-        bytes_per_line = ch * w
-        q_img = QImage(frame_display_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_img)
-        # Check if recognition tab is active for displaying video, or handle as needed
-        # For simplicity, video_label is part of recognition tab, so it updates if that tab is visible.
-        # If video needs to be shown in other contexts, this logic might need adjustment.
-        self.video_label.setPixmap(pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
+    # update_gui_frame is removed; its logic is now in CameraProcessingThread and new slots.
 
     def closeEvent(self, event):
-        logging.info("Close event triggered for main window.")
-        self.timer.stop()
-        if self.cap and self.cap.isOpened():
-            logging.debug("Releasing camera resource.")
-            self.cap.release()
-        if self.hands_instance:
-            logging.debug("Closing MediaPipe Hands resource.")
-            self.hands_instance.close()
-        cv2.destroyAllWindows()
-        logging.info("Application resources released. Exiting.")
+        print("INFO: Close event triggered for main window.")
+        if hasattr(self, 'camera_thread') and self.camera_thread.isRunning():
+            self.camera_thread.stop()
+            self.camera_thread.wait() # Wait for thread to finish
+        
+        # cv2.destroyAllWindows() # Should not be needed if cv2 is only in thread
+        print("INFO: Application resources released. Exiting.")
         event.accept()
-        QApplication.instance().quit() # Ensure application quits properly
+        QApplication.instance().quit()
 
 
 if __name__ == "__main__":
-    setup_logging(log_level=logging.INFO, log_file="asl_alphabet_pyside.log")
+    # setup_logging removed
     
     app = QApplication(sys.argv)
-    main_window = ASLRecognitionApp()
+    main_window = ASLRecognitionApp() # __init__ now starts the thread
     
-    if main_window.model is None or \
-       (main_window.cap is None or not main_window.cap.isOpened()) or \
-       main_window.hands_instance is None:
-        logging.critical("Application failed to initialize critical components during __init__. Exiting.")
-        # Attempt to show a message box if QApplication is available
-        try:
+    # The old critical component check might need adjustment or removal,
+    # as components are loaded in the thread. Status signals will update UI.
+    # For now, we assume the app will start and the thread will report status.
+    # If initial critical failures (like model path not existing even before thread start)
+    # are a concern, some checks could remain or be adapted.
+    
+    # Example of a pre-thread check that could be added:
+    if not os.path.exists(MODEL_PATH):
+         print(f"CRITICAL: Model file '{MODEL_PATH}' not found. The application might not function correctly.")
+         # Optionally, show a message box and exit
+         try:
             from PySide6.QtWidgets import QMessageBox
             msg_box = QMessageBox()
             msg_box.setIcon(QMessageBox.Critical)
             msg_box.setWindowTitle("Application Error")
-            msg_box.setText("Failed to initialize critical components (Camera, AI Model, or Hand Tracking).\nPlease check logs for details.\nThe application will now exit.")
+            msg_box.setText(f"Critical component '{MODEL_PATH}' is missing.\nThe application may not work as expected.")
             msg_box.exec()
-        except Exception as e_msgbox:
-            logging.error(f"Failed to show critical error message box: {e_msgbox}")
-        sys.exit(-1)
-        
+         except Exception as e_msgbox:
+            print(f"ERROR: Failed to show critical error message box: {e_msgbox}")
+         # Depending on severity, could sys.exit(-1) here
+
     main_window.show()
     
     try:
         sys.exit(app.exec())
     except KeyboardInterrupt:
-        logging.info("Application interrupted by user (Ctrl+C from console).")
-        # Ensure cleanup is called if window might not have been fully closed
-        if hasattr(main_window, 'closeEvent'): # Check if closeEvent can be called
-             main_window.close() # Trigger closeEvent for cleanup
-        else: # Manual cleanup if closeEvent not available/triggered
-            if main_window.cap and main_window.cap.isOpened(): main_window.cap.release()
-            if main_window.hands_instance: main_window.hands_instance.close()
-            cv2.destroyAllWindows()
+        print("INFO: Application interrupted by user (Ctrl+C from console).")
+        if hasattr(main_window, 'closeEvent'):
+             main_window.close()
         sys.exit(0)
     except Exception as e_main_exec:
-        logging.critical(f"Unhandled exception in application exec loop: {e_main_exec}", exc_info=True)
+        print(f"CRITICAL: Unhandled exception in application exec loop: {e_main_exec}")
+        if hasattr(main_window, 'closeEvent'): # Attempt graceful shutdown
+             main_window.close()
         sys.exit(-1)
