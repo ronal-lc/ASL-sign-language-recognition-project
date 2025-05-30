@@ -27,8 +27,8 @@ import time
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import glob
-import logging # Import logging
-from utils import setup_logging # Import the setup_logging function
+# Import logging
+# Import the setup_logging function
 
 # Initialize MediaPipe Hands solution globally for potential re-use if safe,
 # otherwise, it might need to be initialized per process if it's not picklable
@@ -53,9 +53,9 @@ def initialize_worker():
     global hands_worker
     try:
         hands_worker = mp.solutions.hands.Hands(static_image_mode=True, min_detection_confidence=0.5)
-        logging.debug(f"Worker process {os.getpid()} initialized MediaPipe Hands successfully.")
+        print(f"DEBUG: Worker process {os.getpid()} initialized MediaPipe Hands successfully.")
     except Exception as e:
-        logging.error(f"Worker process {os.getpid()} failed to initialize MediaPipe Hands: {e}", exc_info=True)
+        print(f"ERROR: Worker process {os.getpid()} failed to initialize MediaPipe Hands: {e}")
         hands_worker = None # Ensure it's None if initialization fails
 
 def process_single_image_entry(image_path_tuple):
@@ -70,17 +70,17 @@ def process_single_image_entry(image_path_tuple):
     global hands_worker # Uses the hands object initialized by initialize_worker
 
     if hands_worker is None: # Check if worker initialization failed
-        logging.error(f"Skipping processing for {image_path_tuple[0]} in worker {os.getpid()} due to MediaPipe initialization failure.")
+        print(f"ERROR: Skipping processing for {image_path_tuple[0]} in worker {os.getpid()} due to MediaPipe initialization failure.")
         return image_path_tuple[0], []
 
     image_path, label_name = image_path_tuple
     landmarks_results = [] 
-    logging.debug(f"Processing image: {image_path} for label: {label_name} in worker {os.getpid()}")
+    print(f"DEBUG: Processing image: {image_path} for label: {label_name} in worker {os.getpid()}")
 
     try:
         img = cv2.imread(image_path)
         if img is None:
-            logging.warning(f"Failed to load image: {image_path}. Skipping.")
+            print(f"WARNING: Failed to load image: {image_path}. Skipping.")
             return image_path, [] 
 
         # Process original image
@@ -99,9 +99,9 @@ def process_single_image_entry(image_path_tuple):
                 landmarks_list.extend(coords.flatten())
             if len(landmarks_list) == EXPECTED_LANDMARK_LENGTH:
                 landmarks_results.append({'landmarks': landmarks_list, 'label': label_name, 'source': 'original'})
-                logging.debug(f"Extracted original landmarks for {image_path}")
+                print(f"DEBUG: Extracted original landmarks for {image_path}")
             elif results_original.multi_hand_landmarks: # Log if landmarks were found but length was wrong
-                logging.warning(f"Found original hand landmarks for {image_path}, but length {len(landmarks_list)} != {EXPECTED_LANDMARK_LENGTH}.")
+                print(f"WARNING: Found original hand landmarks for {image_path}, but length {len(landmarks_list)} != {EXPECTED_LANDMARK_LENGTH}.")
 
 
         # Process horizontally flipped image (augmentation)
@@ -118,37 +118,37 @@ def process_single_image_entry(image_path_tuple):
                 landmarks_list_flipped.extend(coords.flatten())
             if len(landmarks_list_flipped) == EXPECTED_LANDMARK_LENGTH:
                  landmarks_results.append({'landmarks': landmarks_list_flipped, 'label': label_name, 'source': 'flipped'})
-                 logging.debug(f"Extracted flipped landmarks for {image_path}")
+                 print(f"DEBUG: Extracted flipped landmarks for {image_path}")
             elif results_flipped.multi_hand_landmarks: # Log if landmarks were found but length was wrong
-                 logging.warning(f"Found flipped hand landmarks for {image_path}, but length {len(landmarks_list_flipped)} != {EXPECTED_LANDMARK_LENGTH}.")
+                 print(f"WARNING: Found flipped hand landmarks for {image_path}, but length {len(landmarks_list_flipped)} != {EXPECTED_LANDMARK_LENGTH}.")
         
         return image_path, landmarks_results
     except cv2.error as e_cv2: # Specific OpenCV errors
-        logging.error(f"OpenCV error processing {image_path}: {e_cv2}", exc_info=True)
+        print(f"ERROR: OpenCV error processing {image_path}: {e_cv2}")
         return image_path, [] 
     except Exception as e_generic: # Other errors (e.g., MediaPipe, NumPy)
-        logging.error(f"Generic error processing {image_path} in worker {os.getpid()}: {e_generic}", exc_info=True)
+        print(f"ERROR: Generic error processing {image_path} in worker {os.getpid()}: {e_generic}")
         return image_path, [] 
 
 def load_checkpoint():
     """Loads data from the checkpoint file if it exists."""
     if os.path.exists(CHECKPOINT_FILE):
-        logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' found. Attempting to load.")
+        print(f"INFO: Checkpoint file '{CHECKPOINT_FILE}' found. Attempting to load.")
         try:
             with open(CHECKPOINT_FILE, 'rb') as f:
                 checkpoint_data = pickle.load(f)
-            logging.info("Checkpoint loaded successfully.")
+            print("INFO: Checkpoint loaded successfully.")
             return checkpoint_data.get('data', []), checkpoint_data.get('labels', []), checkpoint_data.get('processed_files', set())
         except Exception as e:
-            logging.error(f"Error loading checkpoint file '{CHECKPOINT_FILE}': {e}. Starting from scratch.", exc_info=True)
+            print(f"ERROR: Error loading checkpoint file '{CHECKPOINT_FILE}': {e}. Starting from scratch.")
             return [], [], set()
     else:
-        logging.info(f"No checkpoint file '{CHECKPOINT_FILE}' found. Starting from scratch.")
+        print(f"INFO: No checkpoint file '{CHECKPOINT_FILE}' found. Starting from scratch.")
         return [], [], set()
 
 def save_checkpoint(data, labels, processed_files):
     """Saves the current state to the checkpoint file."""
-    logging.info(f"Saving checkpoint to '{CHECKPOINT_FILE}' with {len(processed_files)} processed files.")
+    print(f"INFO: Saving checkpoint to '{CHECKPOINT_FILE}' with {len(processed_files)} processed files.")
     checkpoint_data = {
         'data': data, # This can be large, consider if full data save is needed every time
         'labels': labels, # Same as above
@@ -157,25 +157,25 @@ def save_checkpoint(data, labels, processed_files):
     try:
         with open(CHECKPOINT_FILE, 'wb') as f:
             pickle.dump(checkpoint_data, f)
-        logging.info(f"Checkpoint saved successfully to '{CHECKPOINT_FILE}'.")
+        print(f"INFO: Checkpoint saved successfully to '{CHECKPOINT_FILE}'.")
     except Exception as e:
-        logging.error(f"Failed to save checkpoint to '{CHECKPOINT_FILE}': {e}", exc_info=True)
+        print(f"ERROR: Failed to save checkpoint to '{CHECKPOINT_FILE}': {e}")
 
 
 def create_dataset_main():
     """Main function to create the dataset using parallel processing and checkpointing."""
-    logging.info("Starting dataset creation process.")
+    print("INFO: Starting dataset creation process.")
     data, labels, processed_files = load_checkpoint()
     
     initial_processed_count = len(processed_files)
-    logging.info(f"Resuming from checkpoint. Initially {initial_processed_count} files were processed.")
+    print(f"INFO: Resuming from checkpoint. Initially {initial_processed_count} files were processed.")
     
     start_time = time.time()
 
     # Discover all image files
     all_image_paths_with_labels = []
     if not os.path.exists(DATA_DIR):
-        logging.critical(f"Data directory '{DATA_DIR}' does not exist. Cannot proceed.")
+        print(f"CRITICAL: Data directory '{DATA_DIR}' does not exist. Cannot proceed.")
         return
         
     for label_name in sorted(os.listdir(DATA_DIR)): 
@@ -186,7 +186,7 @@ def create_dataset_main():
                           glob.glob(os.path.join(label_path, '*.png'))
             for img_path in sorted(image_files): 
                  all_image_paths_with_labels.append((img_path, label_name))
-    logging.info(f"Discovered a total of {len(all_image_paths_with_labels)} images across all class directories.")
+    print(f"INFO: Discovered a total of {len(all_image_paths_with_labels)} images across all class directories.")
 
     # Filter out already processed files
     image_tasks_to_process = [
@@ -194,12 +194,12 @@ def create_dataset_main():
     ]
     
     if not image_tasks_to_process:
-        logging.info("No new images to process. Dataset is up-to-date based on checkpoint.")
+        print("INFO: No new images to process. Dataset is up-to-date based on checkpoint.")
     else:
-        logging.info(f"Found {len(image_tasks_to_process)} new images to process out of {len(all_image_paths_with_labels)} total discovered images.")
+        print(f"INFO: Found {len(image_tasks_to_process)} new images to process out of {len(all_image_paths_with_labels)} total discovered images.")
 
     num_workers = os.cpu_count() or 1 
-    logging.info(f"Using {num_workers} worker processes for image processing.")
+    print(f"INFO: Using {num_workers} worker processes for image processing.")
 
     processed_count_since_last_checkpoint = 0
     newly_processed_files_count = 0
@@ -218,9 +218,9 @@ def create_dataset_main():
                         for result_entry in landmarks_results_list:
                             data.append(result_entry['landmarks'])
                             labels.append(result_entry['label'])
-                        logging.debug(f"Successfully processed and added landmarks for {original_image_path}.")
+                        print(f"DEBUG: Successfully processed and added landmarks for {original_image_path}.")
                     else:
-                        logging.warning(f"No landmarks extracted or error processing {original_image_path}. It will be marked as processed.")
+                        print(f"WARNING: No landmarks extracted or error processing {original_image_path}. It will be marked as processed.")
                     
                     processed_files.add(original_image_path) 
                     newly_processed_files_count += 1
@@ -234,45 +234,45 @@ def create_dataset_main():
         # Final save of checkpoint after loop finishes
         if processed_count_since_last_checkpoint > 0 or newly_processed_files_count > 0 : # Save if any new work was done
             save_checkpoint(data, labels, processed_files)
-        logging.info(f"Completed processing {newly_processed_files_count} new images.")
+        print(f"INFO: Completed processing {newly_processed_files_count} new images.")
 
     except Exception as e_executor:
-        logging.critical(f"An error occurred during parallel processing: {e_executor}", exc_info=True)
+        print(f"CRITICAL: An error occurred during parallel processing: {e_executor}")
         # Data up to the last successful checkpoint is preserved.
         # Consider if a final checkpoint save attempt is useful here, though data might be inconsistent.
 
     # Save the final complete dataset
     if data and labels:
-        logging.info(f"Saving final dataset to 'data_signs.pickle'. Total landmark entries: {len(data)}.")
+        print(f"INFO: Saving final dataset to 'data_signs.pickle'. Total landmark entries: {len(data)}.")
         try:
             with open('data_signs.pickle', 'wb') as f:
                 pickle.dump({'data': np.array(data), 'labels': np.array(labels)}, f)
-            logging.info(f"Final dataset 'data_signs.pickle' saved successfully.")
+            print(f"INFO: Final dataset 'data_signs.pickle' saved successfully.")
             
             # Optional: remove checkpoint file after successful completion
             if os.path.exists(CHECKPOINT_FILE) and newly_processed_files_count == len(image_tasks_to_process) and len(image_tasks_to_process) > 0:
                  # Only remove if all tasks were processed successfully in this run
                  # os.remove(CHECKPOINT_FILE) 
-                 # logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' removed after successful completion.")
-                 logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' retained. Remove manually if not needed for future resumption.")
+                 # print(f"INFO: Checkpoint file '{CHECKPOINT_FILE}' removed after successful completion.")
+                 print(f"INFO: Checkpoint file '{CHECKPOINT_FILE}' retained. Remove manually if not needed for future resumption.")
             elif os.path.exists(CHECKPOINT_FILE):
-                 logging.info(f"Checkpoint file '{CHECKPOINT_FILE}' retained as not all tasks may have been processed in this run or it was already up-to-date.")
+                 print(f"INFO: Checkpoint file '{CHECKPOINT_FILE}' retained as not all tasks may have been processed in this run or it was already up-to-date.")
 
         except Exception as e_pickle_save:
-            logging.critical(f"Failed to save the final dataset to 'data_signs.pickle': {e_pickle_save}", exc_info=True)
+            print(f"CRITICAL: Failed to save the final dataset to 'data_signs.pickle': {e_pickle_save}")
     else:
-        logging.warning("No data was processed or loaded. Final dataset 'data_signs.pickle' was not created.")
+        print("WARNING: No data was processed or loaded. Final dataset 'data_signs.pickle' was not created.")
 
     end_time = time.time()
-    logging.info(f"Total processing time for this run: {end_time - start_time:.2f} seconds.")
-    logging.info("Dataset creation process finished.")
+    print(f"INFO: Total processing time for this run: {end_time - start_time:.2f} seconds.")
+    print("INFO: Dataset creation process finished.")
 
 
 if __name__ == "__main__":
-    setup_logging(log_level=logging.INFO, log_file="create_dataset.log")
+    # setup_logging(log_level=logging.INFO, log_file="create_dataset.log") # Removed
     
     if not os.path.exists(DATA_DIR) or not os.listdir(DATA_DIR):
-        logging.error(f"Data directory '{DATA_DIR}' is missing or empty.")
-        logging.error("Please populate it with image subfolders (A, B, C, etc.) before running.")
+        print(f"ERROR: Data directory '{DATA_DIR}' is missing or empty.")
+        print("ERROR: Please populate it with image subfolders (A, B, C, etc.) before running.")
     else:
         create_dataset_main()
