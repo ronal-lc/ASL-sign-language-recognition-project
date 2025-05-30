@@ -1,5 +1,4 @@
-"""
-ASL Alphabet Real-Time Recognition
+"""ASL Alphabet Real-Time Recognition
 
 This script provides a GUI for real-time American Sign Language (ASL) hand sign recognition using a webcam.
 It uses MediaPipe for hand landmark detection and a trained Keras model for classification.
@@ -147,8 +146,8 @@ LIGHT_THEME_STYLESHEET = """
         border: 1px solid #CCCCCC;
     }
     #LearningImageLabel {
-        background-color: #e8e8e8;
-        border: 2px dashed #c0c0c0;
+        background-color: transparent;
+        border: none;
         font-size: 16px; /* Base size */
         color: #555;
     }
@@ -260,8 +259,8 @@ DARK_THEME_STYLESHEET = """
         border: 1px solid #4a4a4a;
     }
     #LearningImageLabel {
-        background-color: #3c3c3c;
-        border: 2px dashed #5a5a5a;
+        background-color: transparent;
+        border: none;
         font-size: 16px; /* Base size */
         color: #aaa;
     }
@@ -355,7 +354,7 @@ class CameraProcessingThread(QThread):
             frame_rgb_for_mediapipe.flags.writeable = False # To improve performance
             results = self.hands_instance.process(frame_rgb_for_mediapipe)
             print(f"DEBUG_MEDIAPIPE: results.multi_hand_landmarks = {results.multi_hand_landmarks}")
-
+            
             # frame_rgb_for_mediapipe.flags.writeable = True # Set back if further processing on this RGB frame is needed
 
             predicted_char_to_emit = "" # Default to empty string
@@ -364,26 +363,57 @@ class CameraProcessingThread(QThread):
             # Draw landmarks on the original BGR 'frame' if hands are detected
             if results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
-                    print(f"DEBUG_MEDIAPIPE: Processing hand_landmarks (first 5): {str(hand_landmarks)[:300]}")
+                    data_aux = []
+                    x_, y_ = [], []
+
+                    # Usar estilos predeterminados de MediaPipe para landmarks y conexiones
                     mp_drawing.draw_landmarks(
-                        image=frame, # Draw on the BGR frame
-                        landmark_list=hand_landmarks,
-                        connections=mp.solutions.hands.HAND_CONNECTIONS,
-                        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                        frame,
+                        hand_landmarks,
+                        mp.solutions.hands.HAND_CONNECTIONS,
+                        mp.solutions.drawing_styles.get_default_hand_landmarks_style(),
+                        mp.solutions.drawing_styles.get_default_hand_connections_style()
                     )
 
+                    # Extraer coordenadas normalizadas
+                    for lm in hand_landmarks.landmark:
+                        x_.append(lm.x)
+                        y_.append(lm.y)
+
+                    # Normalizar coordenadas para predicción
+                    for i in range(len(hand_landmarks.landmark)):
+                        data_aux.append(x_[i] - min(x_))
+                        data_aux.append(y_[i] - min(y_))
+                    data_aux = data_aux[:42]  # Limitar a los primeros 42 valores
+
+                    # Realizar predicción con el modelo
+                    prediction = self.model.predict(np.array([data_aux]))
+                    max_prob = np.max(prediction[0])
+                    predicted_index = np.argmax(prediction[0])
+                    predicted_character = self.labels_dict[predicted_index] if max_prob >= 0.9 else '?'
+
+                    # Calcular posición del texto
+                    x1 = int(min(x_) * W) - 10
+                    y1 = int(min(y_) * H) - 10
+
+                   
                     # Data extraction for prediction
                     data_aux = []
-                    x_coords = [lm.x for lm in hand_landmarks.landmark]
-                    y_coords = [lm.y for lm in hand_landmarks.landmark]
-                    if not x_coords or not y_coords: continue
+                    x_coords_norm = [lm.x for lm in hand_landmarks.landmark] # Normalized coords
+                    y_coords_norm = [lm.y for lm in hand_landmarks.landmark] # Normalized coords
+                    if not x_coords_norm or not y_coords_norm: continue
 
-                    min_x, min_y = min(x_coords), min(y_coords)
-                    for i in range(len(x_coords)):
-                        data_aux.append(x_coords[i] - min_x)
-                        data_aux.append(y_coords[i] - min_y)
+                    # For data_aux, use normalized relative coordinates
+                    min_x_norm, min_y_norm = min(x_coords_norm), min(y_coords_norm)
+                    for i in range(len(x_coords_norm)):
+                        data_aux.append(x_coords_norm[i] - min_x_norm)
+                        data_aux.append(y_coords_norm[i] - min_y_norm)
+
+                    # For text placement, calculate absolute pixel coordinates
+                    x_coords_abs = [int(x * W) for x in x_coords_norm]
+                    y_coords_abs = [int(y * H) for y in y_coords_norm]
                     
+                    # min_x, min_y = min(x_coords), min(y_coords) # Original calculation for data_aux
                     if self.model and len(data_aux) == self.model.input_shape[1]:
                         prediction_array = np.array([data_aux])
                         try:
@@ -393,24 +423,32 @@ class CameraProcessingThread(QThread):
                             predicted_character = self.labels_dict.get(predicted_index, '?')
                             print(f"DEBUG_PREDICT: Raw prediction: '{predicted_character}', Confidence: {max_prob:.4f}")
                             
-                            # For now, only emit if confidence is high for non-STOP, or very high for STOP
-                            # This logic can be adjusted or moved to main thread based on `prediction_ready`
                             if (predicted_character == "STOP" and max_prob >= 0.99) or \
                                (predicted_character != "STOP" and 'A' <= predicted_character <= 'Z' and max_prob >= 0.95):
-                                predicted_char_to_emit = predicted_character # Store it to emit after loop
+                                predicted_char_to_emit = predicted_character 
                                 confidence_to_emit = float(max_prob)
 
+                                # Draw text next to hand if a valid prediction is made for this hand
+                                max_x_for_text = max(x_coords_abs) if x_coords_abs else W 
+                                min_y_for_text = min(y_coords_abs) if y_coords_abs else 0
+                                
+                                text_x = max_x_for_text + 10
+                                # Ensure y is within frame and not too high, considering text height (approx 20-30px for scale 0.7-1)
+                                text_y = max(30, min_y_for_text) 
+                                # Further ensure text_y is not too low if hand is at bottom of frame
+                                text_y = min(text_y, H - 10) # Ensure it's not off the bottom of the screen
+
+                                text_to_draw = f"{predicted_char_to_emit} ({confidence_to_emit:.0%})"
+                                cv2.putText(frame, text_to_draw, (text_x, text_y), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
                         except Exception as e_predict:
                             self.status_update.emit(f"Model prediction error: {e_predict}")
-                            # Continue, don't break loop for one prediction error
                 
-            # After iterating through all hands (though max_num_hands=1)
-            if predicted_char_to_emit: # If a character met threshold
-                # Draw confidence on frame
-                text_to_draw = f"{predicted_char_to_emit} ({confidence_to_emit:.0%})"
-                cv2.putText(frame, text_to_draw, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                # Emit only the character
+            # After iterating through all hands (max_num_hands=1, so this loop runs once if a hand is found)
+            # The text drawing is now done inside the loop, associated with the hand.
+            # The old fixed-position drawing (if predicted_char_to_emit was true after loop) is removed.
+            
+            if predicted_char_to_emit: # If a character met threshold from the hand
                 self.prediction_ready.emit(predicted_char_to_emit)
 
             # After processing and potential drawing, convert the (possibly annotated) BGR frame to RGB for QImage
@@ -438,9 +476,12 @@ class CameraProcessingThread(QThread):
 
 class ASLRecognitionApp(QMainWindow):
     # Font scaling UI and related variables removed
+    TARGET_PRACTICE_IMAGE_SIZE = (200, 200) # Uniform size for practice images
 
     def __init__(self):
         super().__init__()
+        self.current_practice_mode = "Random" # Default practice mode
+        self.manual_target_letter = "A"      # Default for manual selection
         self.setWindowTitle(WINDOW_NAME)
         if os.path.exists(ICON_PATH):
             try: self.setWindowIcon(QIcon(ICON_PATH))
@@ -472,10 +513,16 @@ class ASLRecognitionApp(QMainWindow):
         # Camera and Processing Thread Setup
         self.camera_thread = CameraProcessingThread(MODEL_PATH, ALPHABET_PATH, self.labels_dict)
         self.camera_thread.frame_ready.connect(self.display_video_frame)
-        self.camera_thread.prediction_ready.connect(self.update_prediction)
+        self.camera_thread.prediction_ready.connect(self.update_prediction) # Signature already (str)
         self.camera_thread.status_update.connect(self.handle_status_update)
         self.camera_thread.model_loaded.connect(self.on_model_loaded)
         self.camera_thread.mediapipe_loaded.connect(self.on_mediapipe_loaded)
+
+        # Connect new practice mode signals
+        if hasattr(self, 'practice_mode_combo'): # Check if UI setup was successful
+            self.practice_mode_combo.currentTextChanged.connect(self.on_practice_mode_changed)
+        if hasattr(self, 'letter_select_combo'):
+            self.letter_select_combo.currentTextChanged.connect(self.on_manual_letter_selected)
         
         self.camera_thread.start()
         print("ASLRecognitionApp initialized and camera thread started.")
@@ -541,7 +588,7 @@ class ASLRecognitionApp(QMainWindow):
                 self.phrase_label.setText(f"Sign: {predicted_character} | Phrase: {self.detected_phrase}")
         elif self.stop_detected: # If STOP was detected and is still active
              self.phrase_label.setStyleSheet(f"font-size: 16px; background-color: darkblue; color: white; padding: 5px; border-radius: 5px;") # Ensure style remains
-             self.phrase_label.setText(f"Sign: STOP | Phrase: {self.detected_phrase}")
+             self.phrase_label.setText(f"Sign: STOP | Phrase: {self.detected_phrase}") 
         else: # Not learning, not stop_detected, but also not adding to phrase (e.g. debounce)
              # Update phrase_label (without confidence)
             self.phrase_label.setText(f"Sign: {predicted_character} | Phrase: {self.detected_phrase}")
@@ -607,7 +654,7 @@ class ASLRecognitionApp(QMainWindow):
         self.main_video_label = QLabel("Initializing Camera...") # Renamed from self.video_label
         self.main_video_label.setObjectName("MainVideoLabel") # Updated object name
         self.main_video_label.setAlignment(Qt.AlignCenter)
-        self.main_video_label.setMinimumSize(800, 520)
+        self.main_video_label.setMinimumSize(800, 520) 
         recognition_layout.addWidget(self.main_video_label)
 
         self.phrase_label = QLabel("Initializing components...")
@@ -635,24 +682,41 @@ class ASLRecognitionApp(QMainWindow):
 
         # --- Practice Tab ---
         self.practice_tab = QWidget()
-        practice_layout = QHBoxLayout(self.practice_tab) # Changed to QHBoxLayout
+        practice_tab_main_v_layout = QVBoxLayout(self.practice_tab) # Main layout is Vertical
+
+        # Controls layout (Horizontal)
+        practice_controls_layout = QHBoxLayout()
+        practice_controls_layout.addWidget(QLabel("Mode:"))
+        self.practice_mode_combo = QComboBox()
+        self.practice_mode_combo.addItems(["Random", "Manual"])
+        practice_controls_layout.addWidget(self.practice_mode_combo)
+
+        self.letter_select_combo = QComboBox()
+        self.letter_select_combo.addItems([chr(65 + i) for i in range(26)]) # A-Z
+        self.letter_select_combo.setEnabled(False) # Disabled for Random mode initially
+        practice_controls_layout.addWidget(self.letter_select_combo)
+        practice_controls_layout.addStretch() # Push controls to the left
+        
+        practice_tab_main_v_layout.addLayout(practice_controls_layout) # Add controls HBox to main VBox
+
+        # Video and Image layout (Horizontal) - this is the existing QHBoxLayout
+        video_image_layout = QHBoxLayout()
+        
+        self.practice_video_label = QLabel("Camera Feed") 
+        self.practice_video_label.setObjectName("PracticeVideoLabel") 
+        self.practice_video_label.setAlignment(Qt.AlignCenter)
+        self.practice_video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.practice_video_label.setScaledContents(False)
+        video_image_layout.addWidget(self.practice_video_label, 85) # Video on left
 
         self.learning_image_display_label = QLabel("Select 'Practice' tab to start learning.")
         self.learning_image_display_label.setObjectName("LearningImageLabel")
-        self.learning_image_display_label.setAlignment(Qt.AlignCenter)
-        self.learning_image_display_label.setFixedSize(350, 350) # Keep fixed size for image part
-        practice_layout.addWidget(self.learning_image_display_label, 3) # ~30% for image
-
-        self.practice_video_label = QLabel("Camera Feed") # New video label for practice tab
-        self.practice_video_label.setObjectName("PracticeVideoLabel") # Can share "VideoLabel" style or be unique
-        self.practice_video_label.setAlignment(Qt.AlignCenter)
-        self.practice_video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.practice_video_label.setScaledContents(False) # Explicitly False
-        # Minimum size for practice_video_label could be set here if needed, or allow layout to manage
-        # self.practice_video_label.setMinimumSize(400, 300) # Example, adjust as needed
-        practice_layout.addWidget(self.practice_video_label, 7) # ~70% for video
-
-        self.practice_tab.setLayout(practice_layout)
+        self.learning_image_display_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.learning_image_display_label.setMinimumSize(QSize(250, 250))
+        video_image_layout.addWidget(self.learning_image_display_label, 3) # Image on right
+        
+        practice_tab_main_v_layout.addLayout(video_image_layout) # Add video/image HBox to main VBox
+        self.practice_tab.setLayout(practice_tab_main_v_layout)
 
         self.tabs.addTab(self.practice_tab, "Practice")
         self.tabs.currentChanged.connect(self.handle_tab_change)
@@ -707,10 +771,11 @@ class ASLRecognitionApp(QMainWindow):
         print(f"Switched to tab: '{current_tab_text}' (Index: {index})")
         if current_tab_text == "Practice":
             self.learning_mode_active = True
-            self.load_learning_image_pyside() # Load initial image for practice
-            self.last_detection_time = time.time() # Reset timer for practice mode
-            self.current_learning_letter = self.current_learning_letter # Keep or reset based on desired logic
-            self.detected_phrase = "" # Clear phrase when switching to practice
+            # self.load_learning_image_pyside() # Old call
+            self.on_practice_mode_changed(self.practice_mode_combo.currentText()) # Update image based on mode
+            self.last_detection_time = time.time() 
+            # self.current_learning_letter will be set by on_practice_mode_changed via load_learning_image_pyside
+            self.detected_phrase = "" 
             self.phrase_label.setText("Detected: ") # Update UI
             print("Learning mode activated (Practice tab).")
         else: # Recognition tab or any other tab
@@ -723,10 +788,30 @@ class ASLRecognitionApp(QMainWindow):
             print("Learning mode deactivated (Switched to Recognition or other tab).")
 
 
-    def load_learning_image_pyside(self, exclude_letter=None):
-        print(f"DEBUG_PRACTICE: load_learning_image_pyside called. Exclude letter: {exclude_letter}")
+    # Slot methods for practice mode
+    @Slot(str)
+    def on_practice_mode_changed(self, mode):
+        self.current_practice_mode = mode
+        print(f"INFO: Practice mode changed to: {mode}")
+        if mode == "Manual":
+            self.letter_select_combo.setEnabled(True)
+            current_manual_letter = self.letter_select_combo.currentText()
+            self.manual_target_letter = current_manual_letter
+            self.load_learning_image_pyside(force_letter=current_manual_letter)
+        else: # Random mode
+            self.letter_select_combo.setEnabled(False)
+            self.load_learning_image_pyside() # Load a random image
+
+    @Slot(str)
+    def on_manual_letter_selected(self, letter):
+        if self.current_practice_mode == "Manual": # Ensure this only acts if in manual mode
+            self.manual_target_letter = letter
+            print(f"INFO: Manual letter selected: {letter}")
+            self.load_learning_image_pyside(force_letter=letter)
+
+    def load_learning_image_pyside(self, exclude_letter=None, force_letter=None):
+        print(f"DEBUG_PRACTICE: load_learning_image_pyside called. Exclude: {exclude_letter}, Force: {force_letter}, Mode: {self.current_practice_mode}")
         print(f"DEBUG_PRACTICE: ALPHABET_PATH: {ALPHABET_PATH}")
-        # This method now updates self.learning_image_display_label in the "Practice" tab
         if not hasattr(self, 'learning_image_display_label'):
             print("ERROR: learning_image_display_label not found. Cannot load learning image.")
             return
@@ -737,40 +822,70 @@ class ASLRecognitionApp(QMainWindow):
             return
         try:
             images = [f for f in os.listdir(ALPHABET_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and os.path.isfile(os.path.join(ALPHABET_PATH, f))]
-            print(f"DEBUG_PRACTICE: Found images: {images}")
-            if not images:
-                print(f"WARNING: No images found in '{ALPHABET_PATH}'.")
-                self.learning_image_display_label.setText("No images in alphabet folder.")
-                return
-            if exclude_letter:
-                images = [img for img in images if os.path.splitext(img)[0].upper() != exclude_letter.upper()]
-            if not images:
-                print(f"INFO: No new images after excluding '{exclude_letter}'. All letters practiced?")
-                self.learning_image_display_label.setText("All letters practiced! Reset or switch tabs.")
-                self.current_learning_letter = "DONE" # Special state
-                return
+            print(f"DEBUG_PRACTICE: Found images: {images}") # This line might be problematic if images isn't defined yet
+            
+            selected_image_name = None
+            if force_letter:
+                self.current_learning_letter = force_letter.upper()
+                possible_extensions = ['.jpg', '.jpeg', '.png']
+                for ext in possible_extensions:
+                    potential_file = f"{self.current_learning_letter}{ext}"
+                    if os.path.isfile(os.path.join(ALPHABET_PATH, potential_file)):
+                        selected_image_name = potential_file
+                        break
+                if not selected_image_name:
+                    print(f"ERROR_PRACTICE: Image for forced letter '{self.current_learning_letter}' not found in {ALPHABET_PATH}")
+                    self.learning_image_display_label.setText(f"Img for {self.current_learning_letter} not found.")
+                    return
+            elif self.current_practice_mode == "Manual":
+                self.current_learning_letter = self.manual_target_letter.upper()
+                possible_extensions = ['.jpg', '.jpeg', '.png']
+                for ext in possible_extensions:
+                    potential_file = f"{self.current_learning_letter}{ext}"
+                    if os.path.isfile(os.path.join(ALPHABET_PATH, potential_file)):
+                        selected_image_name = potential_file
+                        break
+                if not selected_image_name:
+                    print(f"ERROR_PRACTICE: Image for manual letter '{self.current_learning_letter}' not found.")
+                    self.learning_image_display_label.setText(f"Img for {self.current_learning_letter} not found.")
+                    return
+            else: # Random mode
+                images = [f for f in os.listdir(ALPHABET_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and os.path.isfile(os.path.join(ALPHABET_PATH, f))]
+                if not images:
+                    print(f"WARNING: No images found in '{ALPHABET_PATH}'.")
+                    self.learning_image_display_label.setText("No images in alphabet folder.")
+                    return
+                if exclude_letter:
+                    images = [img for img in images if os.path.splitext(img)[0].upper() != exclude_letter.upper()]
+                if not images:
+                    print(f"INFO: No new images after excluding '{exclude_letter}'. All letters practiced?")
+                    self.learning_image_display_label.setText("All letters practiced! Reset or switch tabs.")
+                    self.current_learning_letter = "DONE" 
+                    return
+                selected_image_name = random.choice(images)
+                self.current_learning_letter = os.path.splitext(selected_image_name)[0].upper()
 
-            selected_image_name = random.choice(images)
-            image_full_path = os.path.join(ALPHABET_PATH, selected_image_name)
             print(f"DEBUG_PRACTICE: Selected image name: {selected_image_name}")
+            image_full_path = os.path.join(ALPHABET_PATH, selected_image_name)
             print(f"DEBUG_PRACTICE: Full image path: {image_full_path}")
             
             try:
                 pil_img = Image.open(image_full_path)
-
+                pil_img = pil_img.resize(self.TARGET_PRACTICE_IMAGE_SIZE, Image.Resampling.LANCZOS)
+                
                 if pil_img.mode == "RGB":
                     qimage_format = QImage.Format_RGB888
                     num_channels = 3
                 elif pil_img.mode == "RGBA":
                     qimage_format = QImage.Format_RGBA8888
                     num_channels = 4
-                else:
+                else: 
                     pil_img = pil_img.convert("RGB")
                     qimage_format = QImage.Format_RGB888
                     num_channels = 3 # RGB after conversion
                 print(f"DEBUG_PRACTICE: PIL Image mode: {pil_img.mode}, width: {pil_img.width}, height: {pil_img.height}, num_channels: {num_channels}")
 
-                img_data = pil_img.tobytes("raw", pil_img.mode)
+                img_data = pil_img.tobytes("raw", pil_img.mode) 
                 q_img = QImage(img_data, pil_img.width, pil_img.height, pil_img.width * num_channels, qimage_format)
             
             except Exception as e_img_load:
@@ -779,7 +894,18 @@ class ASLRecognitionApp(QMainWindow):
                 return # Exit if image can't be processed
 
             q_pixmap = QPixmap.fromImage(q_img)
-            scaled_pixmap = q_pixmap.scaled(self.learning_image_display_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            label_size = self.learning_image_display_label.size()
+            target_w, target_h = self.TARGET_PRACTICE_IMAGE_SIZE
+            
+            if label_size.width() < 50 or label_size.height() < 50: # Arbitrary small threshold
+                current_size = QSize(target_w, target_h)
+                # print(f"WARNING_PRACTICE: learning_image_display_label size is very small ({label_size.width()}x{label_size.height()}). Falling back to TARGET_PRACTICE_IMAGE_SIZE {self.TARGET_PRACTICE_IMAGE_SIZE}.") # Debug
+            else:
+                current_size = label_size
+            
+            scaled_pixmap = q_pixmap.scaled(current_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
             self.learning_image_display_label.setPixmap(scaled_pixmap)
             self.current_learning_letter = os.path.splitext(selected_image_name)[0].upper()
             print(f"INFO: Practice Tab: Displaying image for letter '{self.current_learning_letter}'.")
@@ -790,14 +916,14 @@ class ASLRecognitionApp(QMainWindow):
     @Slot()
     def reset_detected_text_action(self):
         self.detected_phrase = ""
-        self.stop_detected = False
+
         # Reset to a generic message, or specific if theme is known
         base_text = "Detected: "
         if hasattr(self, 'current_theme_name') and self.current_theme_name == "Dark":
              self.phrase_label.setStyleSheet(f"font-size: 16px; background-color: #383838; color: #cfcfcf; padding: 5px; border-radius: 5px;")
         else:
              self.phrase_label.setStyleSheet(f"font-size: 16px; background-color: #e0e0e0; color: black; padding: 5px; border-radius: 5px;")
-        self.phrase_label.setText(base_text)
+        self.phrase_label.setText(base_text) 
         print("INFO: Detected text and STOP state reset.")
 
     # update_gui_frame is removed; its logic is now in CameraProcessingThread and new slots.
