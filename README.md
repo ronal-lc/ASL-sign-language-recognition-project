@@ -102,6 +102,20 @@ To use the real-time ASL recognition and practice features.
     *   **Practice Tab:** Allows you to select or be shown an ASL letter image. You can then try to replicate the sign, and the application will attempt to recognize your gesture.
     *   **Settings:** Theme (Light/Dark) and font size can be adjusted from the settings panel at the bottom. Preferences are saved and loaded.
 
+## Version Compatibility
+This application relies on several libraries such as PySide6, TensorFlow, MediaPipe, and OpenCV. Compatibility issues between different versions of these libraries can sometimes lead to unexpected behavior or errors.
+
+During development and testing (addressing specific GUI issues), the following versions were noted:
+*   PySide6: 6.5.0
+*   TensorFlow: 2.16.1
+*   MediaPipe: 0.10.21
+*   OpenCV (cv2): 4.9.0.80
+
+If you encounter persistent issues, especially related to startup, crashes, or unexpected errors after applying other troubleshooting steps, please consider:
+*   Checking the official documentation for these libraries for known incompatibilities.
+*   Creating a dedicated Python environment (e.g., using venv or conda).
+*   Trying to align your installed versions with the ones listed above or other known stable combinations.
+
 ## Contributing
 
 Contributions are welcome! If you have suggestions for improvements, new features, or find any bugs, please feel free to:
