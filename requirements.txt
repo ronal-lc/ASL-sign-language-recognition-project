@@ -1,8 +1,8 @@
 tensorflow==2.16.1
-mediapipe==0.10.11
+mediapipe==0.10.21
 opencv-python==4.9.0.80
 PySide6==6.5.0
-numpy==1.21.6
+numpy==1.26.4
 Pillow==9.4.0
 scikit-learn==1.2.2
 tqdm==4.66.1
